@@ -130,7 +130,7 @@ pub fn format_utc_timestamp() -> String {
     )
 }
 
-extern "C" {
+unsafe extern "C" {
     fn kill(pid: std::os::raw::c_int, sig: std::os::raw::c_int) -> std::os::raw::c_int;
 }
 

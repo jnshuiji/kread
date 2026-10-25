@@ -22,7 +22,7 @@ extern "C" fn handle_signal(_sig: std::os::raw::c_int) {
     RUNNING.store(false, Ordering::SeqCst);
 }
 
-extern "C" {
+unsafe extern "C" {
     fn signal(signum: std::os::raw::c_int, handler: extern "C" fn(std::os::raw::c_int)) -> usize;
 }
 

@@ -1,7 +1,7 @@
 [package]
 name = "kread_daemon"
 version = "1.0.0"
-edition = "2021"
+edition = "2024"
 authors = ["pochita"]
 description = "Production Rust daemon and safe driver bindings for /dev/kread"
 

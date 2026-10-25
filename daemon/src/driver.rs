@@ -10,7 +10,7 @@ use crate::uapi::{
     KREAD_IOCTL_READ_RANGE, KREAD_MAX_BATCH_COUNT, KREAD_MAX_RANGE_LEN,
 };
 
-extern "C" {
+unsafe extern "C" {
     fn ioctl(fd: std::os::raw::c_int, request: std::os::raw::c_ulong, ...) -> std::os::raw::c_int;
 }
 
