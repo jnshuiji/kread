@@ -1,0 +1,6 @@
+id=kread
+name=kread Companion
+version=1
+versionCode=1
+author=Teamwork
+description=High-concurrency zero-page-fault GKI 6.12 memory engine with /dev/kread ioctl & Rust daemon companion.

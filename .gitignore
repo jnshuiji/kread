@@ -1,0 +1,20 @@
+# Build outputs
+/out/
+*.ko
+*.zip
+
+# Rust compilation artifacts
+/daemon/target/
+
+# Test binaries
+/tests/bin/
+
+# Temporary and editor files
+*.o
+*.mod*
+*.cmd
+.tmp_*
+*.swp
+*.swo
+*~
+.DS_Store

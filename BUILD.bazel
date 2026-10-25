@@ -1,0 +1,27 @@
+load("@kleaf//build/kernel/kleaf:kernel.bzl", "ddk_headers", "ddk_module")
+
+# ---------------------------------------------------------------------------
+# kread: High-concurrency zero-pagefault cross-process memory engine for
+# Android GKI 6.12 (arm64).
+#
+# Provides /dev/kread character device with atomic ioctl system calls:
+#   - KREAD_IOCTL_READ_RANGE: O(1) chunked direct streaming to user buffer
+#   - KREAD_IOCTL_READ_BATCH: page coalescing scatter read directly to user buffer
+# ---------------------------------------------------------------------------
+
+ddk_headers(
+    name = "kread_uapi_headers",
+    hdrs = ["include/kread_uapi.h"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "kread",
+    out = "kread.ko",
+    srcs = ["src/kread.c"],
+    hdrs = ["include/kread_uapi.h"],
+    includes = ["include"],
+    deps = [":kread_uapi_headers"],
+    kernel_build = "//common:kernel_aarch64",
+)

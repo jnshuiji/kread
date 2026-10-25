@@ -1,0 +1,23 @@
+[package]
+name = "kread_daemon"
+version = "1.0.0"
+edition = "2021"
+authors = ["pochita"]
+description = "Production Rust daemon and safe driver bindings for /dev/kread"
+
+[dependencies]
+
+[lib]
+name = "kread_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kread_daemon"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
