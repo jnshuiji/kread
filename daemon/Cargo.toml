@@ -4,6 +4,7 @@ version = "1.0.0"
 edition = "2024"
 authors = ["pochita"]
 description = "Production Rust daemon and safe driver bindings for /dev/kread"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 
@@ -21,3 +22,7 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"

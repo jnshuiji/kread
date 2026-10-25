@@ -3,6 +3,8 @@
 use std::fmt::Write as FmtWrite;
 use std::time::SystemTime;
 
+pub use crate::status::{escape_json, DaemonStatusReport};
+
 /// Formats a byte slice as a canonical hexdump (16 bytes per line with hex offset and ASCII representation).
 pub fn format_hexdump(data: &[u8], base_addr: u64) -> String {
     if data.is_empty() {
@@ -130,63 +132,96 @@ pub fn format_utc_timestamp() -> String {
     )
 }
 
+/// Maximum architectural PID limit supported on 64-bit Linux kernels (4,194,304).
+pub const PID_MAX_LIMIT: u32 = 4_194_304;
+
 unsafe extern "C" {
     fn kill(pid: std::os::raw::c_int, sig: std::os::raw::c_int) -> std::os::raw::c_int;
 }
 
 /// Checks whether a given process ID is currently running on the system.
+///
+/// Strictly bounds the PID within valid Linux kernel PID limits (`1..=PID_MAX_LIMIT`),
+/// eliminating false positives from `kill(0, 0)` (process group) and `kill(-1, 0)` (all processes).
+/// Accurately handles unprivileged callers where `kill(pid, 0)` returns `-1` with `errno == EPERM`.
 pub fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 || pid > PID_MAX_LIMIT {
+        return false;
+    }
     if std::path::Path::new(&format!("/proc/{}", pid)).exists() {
         return true;
     }
-    unsafe { kill(pid as std::os::raw::c_int, 0) == 0 }
-}
-
-/// Status payload for KernelSU WebUI / Action reporting.
-#[derive(Debug, Clone)]
-pub struct DaemonStatusReport {
-    pub device_present: bool,
-    pub device_path: String,
-    pub driver_accessible: bool,
-    pub driver_error: Option<String>,
-    pub daemon_pid: Option<u32>,
-    pub daemon_running: bool,
-    pub daemon_log_path: Option<String>,
-    pub version: String,
-    pub target_arch: String,
-    pub status: String,
-}
-
-impl DaemonStatusReport {
-    /// Formats the report as valid JSON for easy consumption by scripts.
-    pub fn to_json(&self) -> String {
-        let err_json = match &self.driver_error {
-            Some(e) => format!("\"{}\"", e.replace('\"', "\\\"")),
-            None => "null".to_string(),
-        };
-        let pid_json = match self.daemon_pid {
-            Some(p) => p.to_string(),
-            None => "null".to_string(),
-        };
-        let log_json = match &self.daemon_log_path {
-            Some(l) => format!("\"{}\"", l.replace('\"', "\\\"")),
-            None => "null".to_string(),
-        };
-
-        format!(
-            "{{\n  \"device_present\": {},\n  \"device_path\": \"{}\",\n  \"driver_accessible\": {},\n  \"driver_error\": {},\n  \"daemon_pid\": {},\n  \"daemon_running\": {},\n  \"daemon_log_path\": {},\n  \"version\": \"{}\",\n  \"target_arch\": \"{}\",\n  \"status\": \"{}\"\n}}",
-            self.device_present,
-            self.device_path,
-            self.driver_accessible,
-            err_json,
-            pid_json,
-            self.daemon_running,
-            log_json,
-            self.version,
-            self.target_arch,
-            self.status
-        )
+    // SAFETY:
+    // Calling `kill(pid, 0)` with signal 0 performs permission and existence checking
+    // without delivering a signal. With 1 <= pid <= PID_MAX_LIMIT, `pid as c_int` is strictly
+    // positive, guaranteeing POSIX individual process signaling rather than process group signaling.
+    let ret = unsafe { kill(pid as std::os::raw::c_int, 0) };
+    if ret == 0 {
+        return true;
     }
+    let err = std::io::Error::last_os_error();
+    // EPERM (raw OS error 1 on Linux): process exists but caller lacks privilege to signal it.
+    err.raw_os_error() == Some(1)
+}
+
+/// Verifies whether the process with `pid` is running and matches the daemon binary name.
+///
+/// Hardened against:
+/// 1. Zombie / defunct processes (checked via `/proc/<pid>/status` state != 'Z' / 'X').
+/// 2. Argument substring spoofing / false positives (verifies binary via `/proc/<pid>/exe`
+///    or `argv[0]` rather than substring search across `/proc/<pid>/cmdline`).
+pub fn is_daemon_process(pid: u32) -> bool {
+    if !is_pid_alive(pid) {
+        return false;
+    }
+
+    // 1. Zombie / Dead Process Detection via /proc/<pid>/status
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("State:") {
+                let state = rest.trim_start();
+                if state.starts_with('Z') || state.starts_with('X') {
+                    return false;
+                }
+                break;
+            }
+        }
+    }
+
+    // 2. Primary Identity: /proc/<pid>/exe symlink
+    if let Ok(exe_path) = std::fs::read_link(format!("/proc/{}/exe", pid))
+        && let Some(file_name) = exe_path.file_name().and_then(|n| n.to_str())
+    {
+        let clean_name = file_name.strip_suffix(" (deleted)").unwrap_or(file_name);
+        return clean_name == "kread_daemon";
+    }
+
+    // 3. Fallback Identity: /proc/<pid>/comm (maximum 16 bytes on Linux)
+    let comm_matches = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .map(|comm| comm.trim() == "kread_daemon")
+        .unwrap_or(false);
+
+    if !comm_matches {
+        return false;
+    }
+
+    // 4. Cross-Verification: inspect argv[0] from /proc/<pid>/cmdline
+    if let Ok(cmdline) = std::fs::read(format!("/proc/{}/cmdline", pid))
+        && !cmdline.is_empty()
+    {
+        let argv0_bytes = cmdline.split(|&b| b == 0).next().unwrap_or(&[]);
+        if let Ok(argv0) = std::str::from_utf8(argv0_bytes) {
+            let argv0_base = std::path::Path::new(argv0)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(argv0);
+            let clean_base = argv0_base.strip_suffix(" (deleted)").unwrap_or(argv0_base);
+            return clean_base == "kread_daemon";
+        }
+    }
+
+    // If cmdline was empty or inaccessible but comm matched, accept
+    true
 }
 
 #[cfg(test)]
@@ -241,5 +276,33 @@ mod tests {
         assert!(j.contains("\"status\": \"ready\""));
         assert!(j.contains("\"daemon_pid\": 999"));
         assert!(j.contains("\"daemon_running\": true"));
+    }
+
+    #[test]
+    fn test_is_pid_alive_self() {
+        let my_pid = std::process::id();
+        assert!(is_pid_alive(my_pid));
+    }
+
+    #[test]
+    fn test_is_pid_alive_nonexistent() {
+        // PID 4194304 is usually beyond default pid_max (4194304) or unlikely to exist
+        assert!(!is_pid_alive(4_194_300));
+    }
+
+    #[test]
+    fn test_is_pid_alive_bounds() {
+        assert!(!is_pid_alive(0));
+        assert!(!is_pid_alive(u32::MAX));
+        assert!(!is_pid_alive(i32::MAX as u32));
+        assert!(!is_pid_alive(PID_MAX_LIMIT + 1));
+    }
+
+    #[test]
+    fn test_is_daemon_process_rejection() {
+        assert!(!is_daemon_process(0));
+        assert!(!is_daemon_process(u32::MAX));
+        assert!(!is_daemon_process(PID_MAX_LIMIT + 1));
+        assert!(!is_daemon_process(std::process::id()));
     }
 }

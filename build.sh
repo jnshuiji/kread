@@ -50,8 +50,7 @@ DAEMON_DIR="$SCRIPT_DIR/daemon"
 if [ -d "$DAEMON_DIR" ]; then
     (
         cd "$DAEMON_DIR"
-        RUSTFLAGS="-C linker=clang -C link-arg=--target=aarch64-unknown-linux-musl" \
-            cargo build --release --target aarch64-unknown-linux-musl
+        cargo build --release --target aarch64-unknown-linux-musl
     )
     DAEMON_SOURCE="$DAEMON_DIR/target/aarch64-unknown-linux-musl/release/kread_daemon"
     if [ -f "$DAEMON_SOURCE" ]; then

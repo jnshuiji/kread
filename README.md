@@ -199,3 +199,41 @@ adb shell "/data/local/tmp/kread_tests/test_runner.sh"
 5. **Indicator 5 (Concurrency Stress)**: 12 concurrent worker threads sustain high throughput with zero deadlocks.
 6. **Indicator 6 (Low Memory Stress)**: 64 MiB streaming read completes under memory pressure (`MemAvailable < 150 MB`).
 7. **Indicator 7 (Huge Page THP Consistency)**: 2 MiB-aligned THP memory read achieves 100% byte-for-byte consistency.
+
+---
+
+## 8. Real-World Integration: UE4 Reverse Engineering & Real-Time ESP
+
+`kread` serves as the foundational kernel reading engine powering the **PUBG Mobile (`libUE4.so`) reverse-engineering suite** located at `pubgm-re/ue4` and the production root daemon `cored` at `pubgm/daemon`:
+
+### 8.1 UE4 Runtime Primitives ↔ kread IOCTL Mapping
+
+| Reverse Engineering Target | UE4 Architectural Reference | `kread` Driver Primitive | Performance Impact |
+|---|---|---|---|
+| **GNames Table Decoding** | Static VA `0x172E2738` (`pubgm-re/ue4/05-gnames.md`) | `KREAD_IOCTL_READ_BATCH` | Decodes 641-chunk pointer tree in < 1 ms |
+| **GWorld & Level Hierarchy** | GWorld `0x1771CC38` → Levels (+0x120) (`08-object-graph.md`) | `KREAD_IOCTL_READ_RANGE` | Traverses PersistentLevel and secondary levels |
+| **Actor Entity Tracking** | `ULevel::Actors` (+0xA0) (`10-open-items.md`) | `KREAD_IOCTL_READ_RANGE` | Chunked batch read of active actor pointer arrays |
+| **High-Frequency Property Polling** | `Health` (0x1060), `TeamID` (0xB78), `Location` (+0x200) | `KREAD_IOCTL_READ_BATCH` | Gathers full-match entity state at 60 Hz |
+| **ELF .text & .bss Inspection** | Decryption & reflection scanning (`02-text-encryption.md`) | `KREAD_IOCTL_READ_RANGE` | Streams 14.4 MB .bss global space in O(1) memory |
+
+### 8.2 Architectural Decoupling: Kernel ↔ Daemon ↔ Android Overlay
+
+```
+┌───────────────────────────────── Linux Kernel Space (GKI 6.12) ─────────────────────────────────┐
+│  /dev/kread (miscdevice) ── Pure 4-Level Page Table Walk (PGD→P4D→PUD→PMD→PTE, 0 Page Faults)    │
+└───────────────────────────────────────────────┬─────────────────────────────────────────────────┘
+                                                │ ioctl (READ_RANGE / READ_BATCH)
+┌────────────────────────────────────── Root Userspace (cored) ───────────────────────────────────┐
+│  pubgm/daemon (Rust musl binary)                                                                │
+│  - GWorld (0x1771CC38) → Levels (+0x120) → Actors (+0xA0)                                     │
+│  - Reads Entity coordinates, health, team ID, and view matrix at 60 Hz                          │
+│  - Serializes to fixed-length binary protocol frame (2.4 KB)                                     │
+└───────────────────────────────────────────────┬─────────────────────────────────────────────────┘
+                                                │ Linux Abstract Unix Domain Socket ("@perfstats")
+┌────────────────────────────────── Unprivileged Android App (APK) ────────────────────────────────┐
+│  pubgm/android (Kotlin Overlay)                                                                  │
+│  - Untrusted app context, zero root permissions, zero game memory offsets                        │
+│  - World-to-Screen matrix projection & Canvas 2D/3D hardware-accelerated rendering               │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+

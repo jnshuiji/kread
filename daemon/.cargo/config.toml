@@ -1,6 +1,12 @@
+# Cargo Configuration for Cross-Compilation: aarch64-unknown-linux-musl
+#
+# Directs rustc to use clang as the cross-linker driver and lld as the multi-target linker.
+# Suppresses unused compiler driver arguments (-no-pie) passed by rustc for static targets.
+
 [target.aarch64-unknown-linux-musl]
 linker = "clang"
 rustflags = [
     "-C", "link-arg=--target=aarch64-unknown-linux-musl",
     "-C", "link-arg=-fuse-ld=lld",
+    "-C", "link-arg=-Wno-unused-command-line-argument",
 ]

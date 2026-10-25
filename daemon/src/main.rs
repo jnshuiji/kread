@@ -5,25 +5,88 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::Instant;
 
+use kread_daemon::bench::{print_bench_report, run_benchmark, BenchConfig};
 use kread_daemon::driver::KreadDriver;
 use kread_daemon::examples::{
-    format_hexdump, format_utc_timestamp, is_pid_alive, parse_address, parse_length,
+    format_hexdump, format_utc_timestamp, is_daemon_process, parse_address, parse_length,
     DaemonStatusReport,
 };
 use kread_daemon::uapi::{KREAD_DEVICE_PATH, KREAD_MAX_RANGE_LEN};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
+static SIGNAL_PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn handle_signal(_sig: std::os::raw::c_int) {
     RUNNING.store(false, Ordering::SeqCst);
+    let write_fd = SIGNAL_PIPE_WRITE_FD.load(Ordering::SeqCst);
+    if write_fd >= 0 {
+        // SAFETY:
+        // `write` is guaranteed to be POSIX async-signal-safe. The write end of the self-pipe
+        // was opened with O_NONBLOCK, ensuring this call never blocks inside the signal handler.
+        let byte = [1u8];
+        unsafe {
+            write(write_fd, byte.as_ptr() as *const std::os::raw::c_void, 1);
+        }
+    }
 }
 
+/// C ABI `struct sigaction` layout matching Linux 64-bit libc (glibc and musl).
+///
+/// Total size: 152 bytes; alignment: 8 bytes.
+/// - `sa_handler`: offset 0 (8 bytes)
+/// - `sa_mask`: offset 8 (128 bytes, 16x u64)
+/// - `sa_flags`: offset 136 (4 bytes, c_int)
+/// - (padding): offset 140 (4 bytes)
+/// - `sa_restorer`: offset 144 (8 bytes)
+#[repr(C)]
+struct SigAction {
+    sa_handler: Option<extern "C" fn(std::os::raw::c_int)>,
+    sa_mask: [u64; 16],
+    sa_flags: std::os::raw::c_int,
+    sa_restorer: Option<extern "C" fn()>,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<SigAction>() == 152);
+    assert!(std::mem::align_of::<SigAction>() == 8);
+    assert!(std::mem::offset_of!(SigAction, sa_handler) == 0);
+    assert!(std::mem::offset_of!(SigAction, sa_mask) == 8);
+    assert!(std::mem::offset_of!(SigAction, sa_flags) == 136);
+    assert!(std::mem::offset_of!(SigAction, sa_restorer) == 144);
+};
+
+#[repr(C)]
+struct PollFd {
+    fd: std::os::raw::c_int,
+    events: std::os::raw::c_short,
+    revents: std::os::raw::c_short,
+}
+
+const POLLIN: std::os::raw::c_short = 0x0001;
+const O_CLOEXEC: std::os::raw::c_int = 0x80000;
+const O_NONBLOCK: std::os::raw::c_int = 0x800;
+
 unsafe extern "C" {
-    fn signal(signum: std::os::raw::c_int, handler: extern "C" fn(std::os::raw::c_int)) -> usize;
+    fn sigaction(
+        signum: std::os::raw::c_int,
+        act: *const SigAction,
+        oldact: *mut SigAction,
+    ) -> std::os::raw::c_int;
+    fn pipe2(pipefd: *mut std::os::raw::c_int, flags: std::os::raw::c_int) -> std::os::raw::c_int;
+    fn poll(
+        fds: *mut PollFd,
+        nfds: std::os::raw::c_ulong,
+        timeout: std::os::raw::c_int,
+    ) -> std::os::raw::c_int;
+    fn close(fd: std::os::raw::c_int) -> std::os::raw::c_int;
+    fn write(
+        fd: std::os::raw::c_int,
+        buf: *const std::os::raw::c_void,
+        count: usize,
+    ) -> isize;
 }
 
 fn print_usage() {
@@ -50,13 +113,50 @@ fn print_usage() {
     );
 }
 
-fn determine_runtime_dir() -> PathBuf {
-    let android_tmp = Path::new("/data/local/tmp");
-    if android_tmp.is_dir() {
-        android_tmp.to_path_buf()
-    } else {
-        PathBuf::from("/tmp")
+/// Resolves the secure runtime directory for PID, lock, and log files.
+///
+/// Priority:
+/// 1. Explicit environment variable `KREAD_RUNTIME_DIR` (if set and valid directory).
+/// 2. KernelSU module directory `/data/adb/modules/kread` (if it exists and is a directory).
+/// 3. Secure root-owned fallback directory with mode 0700:
+///    - On Android: `/data/local/tmp/kread_secure`
+///    - On host/Linux: `/tmp/kread_secure`
+pub fn determine_runtime_dir() -> PathBuf {
+    if let Ok(env_dir) = env::var("KREAD_RUNTIME_DIR") {
+        let p = PathBuf::from(env_dir);
+        if p.is_dir() {
+            return p;
+        }
     }
+
+    let ksu_dir = Path::new("/data/adb/modules/kread");
+    if ksu_dir.is_dir() {
+        return ksu_dir.to_path_buf();
+    }
+
+    // Secure fallback: create private directory with permissions 0700
+    let candidate = if Path::new("/data/local/tmp").is_dir() {
+        PathBuf::from("/data/local/tmp/kread_secure")
+    } else {
+        PathBuf::from("/tmp/kread_secure")
+    };
+
+    if let Ok(meta) = fs::symlink_metadata(&candidate) {
+        if meta.file_type().is_symlink() {
+            let _ = fs::remove_file(&candidate);
+            let _ = fs::create_dir_all(&candidate);
+        }
+    } else {
+        let _ = fs::create_dir_all(&candidate);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700));
+    }
+
+    candidate
 }
 
 fn cmd_range(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -73,7 +173,11 @@ fn cmd_range(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let len = parse_length(&args[2])?;
 
     if len > KREAD_MAX_RANGE_LEN {
-        return Err(format!("Requested length exceeds maximum ({} MB)", KREAD_MAX_RANGE_LEN / (1024 * 1024)).into());
+        return Err(format!(
+            "Requested length exceeds maximum ({} MB)",
+            KREAD_MAX_RANGE_LEN / (1024 * 1024)
+        )
+        .into());
     }
 
     let driver = KreadDriver::open().map_err(|e| {
@@ -138,7 +242,10 @@ fn cmd_batch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = start.elapsed();
 
     println!("{:-<68}", "");
-    println!(" {:<6} | {:<18} | {:<18}", "Index", "Virtual Address", "Value (u64)");
+    println!(
+        " {:<6} | {:<18} | {:<18}",
+        "Index", "Virtual Address", "Value (u64)"
+    );
     println!("{:-<68}", "");
     for (i, (&addr, &val)) in addrs.iter().zip(vals.iter()).enumerate() {
         println!(" [{:04}] | 0x{:016x} | 0x{:016x}", i, addr, val);
@@ -180,54 +287,16 @@ fn cmd_bench(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
 
-    println!("======================================================================");
-    println!(" kread Performance Benchmark");
-    println!(" Target: PID {}, Address 0x{:016x}, Duration: {}s", pid, addr, duration_secs);
-    println!("======================================================================");
+    let config = BenchConfig {
+        pid,
+        addr,
+        duration_secs,
+        warmup_ms: 100,
+        inner_batch_size: 128,
+    };
 
-    // 1. Single 8-byte range read benchmark
-    let bench_duration = Duration::from_secs(duration_secs);
-    let mut buf = [0u8; 8];
-    let mut range_iters = 0u64;
-    let range_start = Instant::now();
-
-    while range_start.elapsed() < bench_duration {
-        let _ = driver.read_range_into(pid, addr, &mut buf)?;
-        range_iters += 1;
-    }
-    let range_elapsed = range_start.elapsed();
-    let range_ops = range_iters as f64 / range_elapsed.as_secs_f64();
-    let range_bytes = range_iters * 8;
-    let range_mbs = (range_bytes as f64 / 1_048_576.0) / range_elapsed.as_secs_f64();
-    let range_latency_us = (range_elapsed.as_micros() as f64) / range_iters as f64;
-
-    println!(" 1. Single Range Read (8 bytes / call):");
-    println!("    Total Calls:   {:>12}", range_iters);
-    println!("    Elapsed Time:  {:>12.3} s", range_elapsed.as_secs_f64());
-    println!("    Throughput:    {:>12.1} ops/sec ({:.2} MiB/s)", range_ops, range_mbs);
-    println!("    Avg Latency:   {:>12.2} µs", range_latency_us);
-    println!();
-
-    // 2. Batch read benchmark (16 addresses)
-    let batch_addrs: Vec<u64> = (0..16).map(|i| addr.wrapping_add(i * 8)).collect();
-    let mut batch_iters = 0u64;
-    let batch_start = Instant::now();
-
-    while batch_start.elapsed() < bench_duration {
-        let _ = driver.read_batch(pid, &batch_addrs)?;
-        batch_iters += 1;
-    }
-    let batch_elapsed = batch_start.elapsed();
-    let batch_calls_sec = batch_iters as f64 / batch_elapsed.as_secs_f64();
-    let batch_addrs_sec = (batch_iters * 16) as f64 / batch_elapsed.as_secs_f64();
-    let batch_latency_us = (batch_elapsed.as_micros() as f64) / batch_iters as f64;
-
-    println!(" 2. Scatter Batch Read (16 addrs / call):");
-    println!("    Total Calls:   {:>12}", batch_iters);
-    println!("    Total Addrs:   {:>12}", batch_iters * 16);
-    println!("    Throughput:    {:>12.1} calls/sec ({:.1} addrs/sec)", batch_calls_sec, batch_addrs_sec);
-    println!("    Avg Latency:   {:>12.2} µs", batch_latency_us);
-    println!("======================================================================");
+    let report = run_benchmark(&driver, &config)?;
+    print_bench_report(&report);
 
     Ok(())
 }
@@ -251,10 +320,33 @@ fn cmd_daemon(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let current_pid = process::id();
     fs::write(&pid_path, current_pid.to_string())?;
 
-    // Install signal handlers for SIGINT (2) and SIGTERM (15)
+    // Create self-pipe for interruptible signal waiting
+    let mut pipe_fds = [-1i32; 2];
+    let pipe_ret = unsafe {
+        // SAFETY: pipe2 receives a valid pointer to a stack-allocated 2-element c_int array.
+        // O_CLOEXEC prevents fd leak across exec; O_NONBLOCK ensures async-signal-safe writes.
+        pipe2(pipe_fds.as_mut_ptr(), O_CLOEXEC | O_NONBLOCK)
+    };
+    if pipe_ret < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+    SIGNAL_PIPE_WRITE_FD.store(write_fd, Ordering::SeqCst);
+
+    // Install POSIX sigaction signal handlers for SIGINT (2) and SIGTERM (15)
+    let mut sa: SigAction = unsafe { std::mem::zeroed() };
+    sa.sa_handler = Some(handle_signal);
+    sa.sa_flags = 0; // Explicitly 0: no SA_RESTART so syscalls interrupt promptly
+
     unsafe {
-        signal(2, handle_signal);
-        signal(15, handle_signal);
+        // SAFETY:
+        // 1. AAPCS64 & C ABI: `sigaction` expects integer signum in reg 0, `*const SigAction` in reg 1,
+        //    and null pointer in reg 2.
+        // 2. Struct Invariant: `sa` is zeroed, setting `sa_mask` to empty (no blocked signals) and `sa_flags`
+        //    to 0. `handle_signal` is a valid extern "C" fn using strictly async-signal-safe operations.
+        // 3. Lifetime: `sa` is on the stack and valid for the duration of the synchronous call.
+        sigaction(2, &sa, std::ptr::null_mut());
+        sigaction(15, &sa, std::ptr::null_mut());
     }
 
     let mut log_file = OpenOptions::new()
@@ -269,8 +361,9 @@ fn cmd_daemon(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let start_msg = format!(
-        "[{}] [INFO] kread_daemon v2.0.0 started (pid: {}, arch: {}, interval: {}s)\n",
+        "[{}] [INFO] kread_daemon v{} started (pid: {}, arch: {}, interval: {}s)\n",
         format_utc_timestamp(),
+        env!("CARGO_PKG_VERSION"),
         current_pid,
         arch,
         interval_sec
@@ -311,11 +404,27 @@ fn cmd_daemon(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let _ = log_file.write_all(line.as_bytes());
         let _ = log_file.flush();
 
-        // Sleep with 500ms intervals to remain responsive to signals
-        let sleep_until = Instant::now() + Duration::from_secs(interval_sec);
-        while RUNNING.load(Ordering::SeqCst) && Instant::now() < sleep_until {
-            thread::sleep(Duration::from_millis(250));
+        // Battery-friendly sleep: sleep in deep kernel suspend state via poll() on the self-pipe
+        // for up to interval_sec * 1000 ms. Immediately returns if a signal arrives.
+        let mut pfd = PollFd {
+            fd: read_fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = (interval_sec.min(3600) * 1000) as std::os::raw::c_int;
+
+        unsafe {
+            // SAFETY: poll receives a valid stack pointer to PollFd and descriptor count 1.
+            poll(&mut pfd, 1, timeout_ms);
         }
+    }
+
+    // Clean up self-pipe
+    SIGNAL_PIPE_WRITE_FD.store(-1, Ordering::SeqCst);
+    unsafe {
+        // SAFETY: Closing valid file descriptors returned by pipe2.
+        close(read_fd);
+        close(write_fd);
     }
 
     let stop_msg = format!(
@@ -344,11 +453,11 @@ fn cmd_status() -> Result<(), Box<dyn std::error::Error>> {
     let mut daemon_pid = None;
     let mut daemon_running = false;
 
-    if let Ok(content) = fs::read_to_string(&pid_path) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            daemon_pid = Some(pid);
-            daemon_running = is_pid_alive(pid);
-        }
+    if let Ok(content) = fs::read_to_string(&pid_path)
+        && let Ok(pid) = content.trim().parse::<u32>()
+    {
+        daemon_pid = Some(pid);
+        daemon_running = is_daemon_process(pid);
     }
 
     let status = if driver_accessible {
@@ -405,7 +514,10 @@ fn main() {
             Ok(())
         }
         "version" | "--version" | "-v" => {
-            println!("kread_daemon v{} (ARM64 GKI Modern Edition)", env!("CARGO_PKG_VERSION"));
+            println!(
+                "kread_daemon v{} (ARM64 GKI Modern Edition)",
+                env!("CARGO_PKG_VERSION")
+            );
             Ok(())
         }
         unknown => {
@@ -420,3 +532,29 @@ fn main() {
         process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_determine_runtime_dir() {
+        let dir = determine_runtime_dir();
+        assert!(
+            dir.starts_with("/data/local/tmp")
+                || dir.starts_with("/tmp")
+                || dir.starts_with("/data/adb/modules/kread")
+        );
+    }
+
+    #[test]
+    fn test_sigaction_abi_layout() {
+        assert_eq!(std::mem::size_of::<SigAction>(), 152);
+        assert_eq!(std::mem::align_of::<SigAction>(), 8);
+        assert_eq!(std::mem::offset_of!(SigAction, sa_handler), 0);
+        assert_eq!(std::mem::offset_of!(SigAction, sa_mask), 8);
+        assert_eq!(std::mem::offset_of!(SigAction, sa_flags), 136);
+        assert_eq!(std::mem::offset_of!(SigAction, sa_restorer), 144);
+    }
+}
+

@@ -2,6 +2,7 @@
 # KernelSU Action script for kread Companion
 
 MODDIR=${0%/*}
+export KREAD_RUNTIME_DIR="$MODDIR"
 
 echo "=========================================="
 echo "       kread Companion Action Status      "
@@ -34,8 +35,10 @@ echo "[2] Character Device (/dev/kread):"
 if [ -e /dev/kread ]; then
     echo "  Presence: PRESENT"
     echo "  Permissions: $(ls -l /dev/kread)"
-    # Ensure correct permissions
-    chmod 0666 /dev/kread
+    # Ensure secure permissions (0600 root:root)
+    chown root:root /dev/kread 2>/dev/null || true
+    chmod 0600 /dev/kread 2>/dev/null || true
+    echo "  Secured: $(ls -l /dev/kread)"
 else
     echo "  Presence: MISSING (/dev/kread not found)"
 fi

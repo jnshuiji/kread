@@ -4,21 +4,32 @@
 //! - `KREAD_IOCTL_READ_RANGE`: Atomic cross-process range read directly streaming into caller buffer.
 //! - `KREAD_IOCTL_READ_BATCH`: Atomic cross-process scatter batch read into caller value array.
 
+/// Magic number for kread ioctl requests ('k' = 0x6b).
 pub const KREAD_IOCTL_MAGIC: u8 = b'k';
 
-// Linux ioctl encoding constants (asm-generic / arm64 / x86_64 standard)
+/// Number of bits allocated for the ioctl sequence number.
 pub const IOC_NRBITS: u32 = 8;
+/// Number of bits allocated for the ioctl magic type field.
 pub const IOC_TYPEBITS: u32 = 8;
+/// Number of bits allocated for the ioctl data size field.
 pub const IOC_SIZEBITS: u32 = 14;
+/// Number of bits allocated for the ioctl data transfer direction field.
 pub const IOC_DIRBITS: u32 = 2;
 
+/// Bit shift for ioctl sequence number.
 pub const IOC_NRSHIFT: u32 = 0;
+/// Bit shift for ioctl magic type field.
 pub const IOC_TYPESHIFT: u32 = IOC_NRSHIFT + IOC_NRBITS;
+/// Bit shift for ioctl data size field.
 pub const IOC_SIZESHIFT: u32 = IOC_TYPESHIFT + IOC_TYPEBITS;
+/// Bit shift for ioctl data direction field.
 pub const IOC_DIRSHIFT: u32 = IOC_SIZESHIFT + IOC_SIZEBITS;
 
+/// Direction bitmask representing no data transfer.
 pub const IOC_NONE: u32 = 0;
+/// Direction bitmask representing data written by user to driver.
 pub const IOC_WRITE: u32 = 1;
+/// Direction bitmask representing data read by user from driver.
 pub const IOC_READ: u32 = 2;
 
 /// Computes Linux ioctl request code.
@@ -121,12 +132,24 @@ mod tests {
     fn test_ioctl_range_layout() {
         assert_eq!(std::mem::size_of::<KreadIoctlRange>(), 40);
         assert_eq!(std::mem::align_of::<KreadIoctlRange>(), 8);
+        assert_eq!(std::mem::offset_of!(KreadIoctlRange, target_pid), 0);
+        assert_eq!(std::mem::offset_of!(KreadIoctlRange, pad), 4);
+        assert_eq!(std::mem::offset_of!(KreadIoctlRange, addr), 8);
+        assert_eq!(std::mem::offset_of!(KreadIoctlRange, len), 16);
+        assert_eq!(std::mem::offset_of!(KreadIoctlRange, out_buf), 24);
+        assert_eq!(std::mem::offset_of!(KreadIoctlRange, out_len), 32);
     }
 
     #[test]
     fn test_ioctl_batch_layout() {
         assert_eq!(std::mem::size_of::<KreadIoctlBatch>(), 32);
         assert_eq!(std::mem::align_of::<KreadIoctlBatch>(), 8);
+        assert_eq!(std::mem::offset_of!(KreadIoctlBatch, target_pid), 0);
+        assert_eq!(std::mem::offset_of!(KreadIoctlBatch, count), 4);
+        assert_eq!(std::mem::offset_of!(KreadIoctlBatch, addrs_ptr), 8);
+        assert_eq!(std::mem::offset_of!(KreadIoctlBatch, vals_ptr), 16);
+        assert_eq!(std::mem::offset_of!(KreadIoctlBatch, success_count), 24);
+        assert_eq!(std::mem::offset_of!(KreadIoctlBatch, pad), 28);
     }
 
     #[test]
