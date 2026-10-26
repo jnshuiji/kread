@@ -14,8 +14,13 @@
 *.mod*
 *.cmd
 .tmp_*
+.thinlto-cache/
+Module.symvers
+modules.order
+__pycache__/
 *.swp
 *.swo
 *~
 .DS_Store
 .agents
+

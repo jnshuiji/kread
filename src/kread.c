@@ -26,6 +26,7 @@
 #include <linux/sched.h>
 #include <linux/sched/task.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/mm.h>
 #include <linux/pid.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
@@ -36,8 +37,17 @@
 #include <linux/sort.h>
 #include <linux/byteorder/generic.h>
 #include <linux/compat.h>
+#include <linux/version.h>
 #include <asm/pgtable.h>
 #include <asm/page.h>
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+#define kread_pud_leaf(v) (pud_sect(v) || pud_trans_huge(v))
+#define kread_pmd_leaf(v) (pmd_sect(v) || pmd_trans_huge(v))
+#else
+#define kread_pud_leaf(v) (pud_leaf(v) || pud_trans_huge(v))
+#define kread_pmd_leaf(v) (pmd_leaf(v) || pmd_trans_huge(v))
+#endif
 
 #if __has_include("kread_uapi.h")
 #include "kread_uapi.h"
@@ -102,7 +112,7 @@ static const char *kread_walk_page(struct mm_struct *mm, unsigned long page_va)
 	if (pud_none(pudval))
 		return NULL;
 
-	if (pud_leaf(pudval) || pud_trans_huge(pudval)) {
+	if (kread_pud_leaf(pudval)) {
 		if (!pud_present(pudval))
 			return NULL;
 		pfn = pud_pfn(pudval) + ((page_va & ~PUD_MASK) >> PAGE_SHIFT);
@@ -120,7 +130,7 @@ static const char *kread_walk_page(struct mm_struct *mm, unsigned long page_va)
 	if (pmd_none(pmdval))
 		return NULL;
 
-	if (pmd_leaf(pmdval) || pmd_trans_huge(pmdval)) {
+	if (kread_pmd_leaf(pmdval)) {
 		if (!pmd_present(pmdval))
 			return NULL;
 		pfn = pmd_pfn(pmdval) + ((page_va & ~PMD_MASK) >> PAGE_SHIFT);

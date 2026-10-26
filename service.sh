@@ -27,16 +27,27 @@ log "INFO: Boot completed detected."
 
 # 2. Insert kernel module with verification
 if ! lsmod | grep -q "^kread "; then
-    if [ -f "$MODDIR/kread.ko" ]; then
-        log "INFO: Inserting $MODDIR/kread.ko..."
-        insmod "$MODDIR/kread.ko" 2>> "$LOGFILE"
+    TARGET_KO="$MODDIR/kread.ko"
+    KERNEL_VER=$(uname -r)
+
+    # Dynamic fallback check if kread.ko is missing or multi-ko package is present
+    if [ ! -f "$TARGET_KO" ]; then
+        case "$KERNEL_VER" in
+            *5.10*) TARGET_KO="$MODDIR/kread_5.10.ko" ;;
+            *6.12*) TARGET_KO="$MODDIR/kread_6.12.ko" ;;
+        esac
+    fi
+
+    if [ -f "$TARGET_KO" ]; then
+        log "INFO: Inserting $TARGET_KO (detected kernel: $KERNEL_VER)..."
+        insmod "$TARGET_KO" 2>> "$LOGFILE"
         if ! lsmod | grep -q "^kread "; then
-            log "ERROR: insmod failed. Check dmesg for kernel symbols or vermagic mismatch."
+            log "ERROR: insmod failed for $TARGET_KO. Check dmesg for kernel symbols or vermagic mismatch."
             exit 1
         fi
-        log "INFO: kread.ko loaded successfully."
+        log "INFO: $TARGET_KO loaded successfully."
     else
-        log "ERROR: Module kread.ko not found in $MODDIR."
+        log "ERROR: Module kread.ko not found in $MODDIR for kernel $KERNEL_VER."
         exit 1
     fi
 else

@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""
+build.py - Python unified build and packaging engine for kread companion module.
+Supports:
+  - Linux 5.10 (Android 12 GKI) via Android Clang-r416183b & Kbuild
+  - Linux 6.12 (Android 16 GKI) via Kleaf Bazel DDK
+  - Rust Daemon cross-compilation (aarch64-unknown-linux-musl)
+  - Universal Multi-KMI Fat ZIP packaging (auto-detecting 5.10 / 6.12 at runtime)
+"""
+
+import argparse
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Optional
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+
+    console = Console()
+except ImportError:
+    # Minimal fallback if rich is not present
+    class SimpleConsole:
+        def print(self, *args, **kwargs):
+            text = " ".join(str(a) for a in args)
+            import re
+            clean = re.sub(r"\[/?\w+[^\]]*\]", "", text)
+            print(clean)
+
+    console = SimpleConsole()
+
+
+def compute_sha256(file_path: Path) -> str:
+    sha = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
+def format_bytes(size: int) -> str:
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+
+class KreadBuilder:
+    def __init__(self, workspace_root: Optional[Path] = None):
+        self.module_dir = Path(__file__).resolve().parent
+        self.workspace_root = workspace_root or self.module_dir.parent.parent
+        self.k510_root = self.workspace_root / "android12-5.10"
+        self.k612_root = self.workspace_root / "android16-6.12"
+        self.out_dir = self.module_dir / "out"
+        self.staging_dir = self.out_dir / "staging"
+        self.version = self._get_version()
+
+    def _get_version(self) -> str:
+        prop_file = self.module_dir / "module.prop"
+        if prop_file.exists():
+            for line in prop_file.read_text(encoding="utf-8").splitlines():
+                if line.startswith("version="):
+                    return line.split("=", 1)[1].strip()
+        return "1.0.0"
+
+    def build_ko_510(self) -> Optional[Path]:
+        """Build kread_5.10.ko using android12-5.10 toolchain and out directory."""
+        console.print("[bold cyan]🔨 [1/3] Building kread.ko for Android 12 (Linux 5.10 GKI)...[/bold cyan]")
+        kdir = self.k510_root / "out" / "android12-5.10" / "common"
+        if not kdir.exists():
+            console.print(f"[bold red]❌ Linux 5.10 build tree not found at {kdir}. Please build android12-5.10 first.[/bold red]")
+            return None
+
+        clang_bin = self.k510_root / "prebuilts-master" / "clang" / "host" / "linux-x86" / "clang-r416183b" / "bin"
+        build_tools_bin = self.k510_root / "build" / "build-tools" / "path" / "linux-x86"
+        gas_bin = self.k510_root / "prebuilts" / "gas" / "linux-x86"
+
+        custom_path = f"{build_tools_bin}:{clang_bin}:{gas_bin}:{os.environ.get('PATH', '')}"
+        env = os.environ.copy()
+        env["PATH"] = custom_path
+
+        cmd = [
+            "make",
+            "-C", str(kdir),
+            f"M={self.module_dir}",
+            "ARCH=arm64",
+            "CROSS_COMPILE=aarch64-linux-gnu-",
+            "LLVM=1",
+            "LLVM_IAS=1",
+            "modules",
+        ]
+
+        start_time = time.time()
+        res = subprocess.run(cmd, cwd=self.module_dir, env=env, capture_output=True, text=True)
+        duration = time.time() - start_time
+
+        ko_file = self.module_dir / "kread.ko"
+        if res.returncode == 0 and ko_file.exists():
+            dest_510 = self.module_dir / "kread_5.10.ko"
+            shutil.copy2(ko_file, dest_510)
+            size_str = format_bytes(dest_510.stat().st_size)
+            console.print(f"  [bold green]✓ Built kread_5.10.ko ({size_str}) in {duration:.1f}s[/bold green]")
+            return dest_510
+        else:
+            console.print(f"[bold red]❌ Build 5.10 failed ({res.returncode}):[/bold red]")
+            console.print(res.stderr or res.stdout, markup=False)
+            return None
+
+    def build_ko_612(self) -> Optional[Path]:
+        """Build kread_6.12.ko using android16-6.12 Kleaf Bazel."""
+        console.print("[bold cyan]🔨 [2/3] Building kread.ko for Android 16 (Linux 6.12 GKI via Kleaf)...[/bold cyan]")
+        if not self.k612_root.exists():
+            console.print(f"[bold red]❌ Kleaf workspace not found at {self.k612_root}.[/bold red]")
+            return None
+
+        cmd = ["tools/bazel", "build", "//modules/kread:kread"]
+        start_time = time.time()
+        res = subprocess.run(cmd, cwd=self.k612_root, capture_output=True, text=True)
+        duration = time.time() - start_time
+
+        bazel_out = self.k612_root / "bazel-bin" / "modules" / "kread" / "kread" / "kread.ko"
+        if res.returncode == 0 and bazel_out.exists():
+            dest_612 = self.module_dir / "kread_6.12.ko"
+            shutil.copy2(bazel_out, dest_612)
+            size_str = format_bytes(dest_612.stat().st_size)
+            console.print(f"  [bold green]✓ Built kread_6.12.ko ({size_str}) in {duration:.1f}s[/bold green]")
+            return dest_612
+        else:
+            console.print(f"[bold red]❌ Build 6.12 failed ({res.returncode}):[/bold red]")
+            console.print(res.stderr or res.stdout, markup=False)
+            return None
+
+    def build_daemon(self) -> Optional[Path]:
+        """Compile Rust daemon statically for aarch64-unknown-linux-musl."""
+        console.print("[bold cyan]🦀 [3/3] Compiling static ARM64 Rust Daemon (kread_daemon)...[/bold cyan]")
+        daemon_dir = self.module_dir / "daemon"
+        if not daemon_dir.exists():
+            console.print(f"[bold red]❌ Daemon directory {daemon_dir} not found.[/bold red]")
+            return None
+
+        cmd = ["cargo", "build", "--release", "--target", "aarch64-unknown-linux-musl"]
+        start_time = time.time()
+        res = subprocess.run(cmd, cwd=daemon_dir, capture_output=True, text=True)
+        duration = time.time() - start_time
+
+        daemon_bin = daemon_dir / "target" / "aarch64-unknown-linux-musl" / "release" / "kread_daemon"
+        if res.returncode == 0 and daemon_bin.exists():
+            size_str = format_bytes(daemon_bin.stat().st_size)
+            console.print(f"  [bold green]✓ Built static kread_daemon ({size_str}) in {duration:.1f}s[/bold green]")
+            return daemon_bin
+        else:
+            console.print(f"[bold red]❌ Cargo build failed ({res.returncode}):[/bold red]")
+            console.print(res.stderr or res.stdout, markup=False)
+            return None
+
+    def package(
+        self,
+        target: str = "all",
+        ko_510: Optional[Path] = None,
+        ko_612: Optional[Path] = None,
+        daemon_bin: Optional[Path] = None,
+        extra_out_dir: Optional[Path] = None,
+    ) -> Optional[Path]:
+        """Assemble staging directory and create flashable KernelSU / Magisk ZIP."""
+        console.print(f"\n[bold cyan]📦 Packaging kread Companion Module (Target: {target})...[/bold cyan]")
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        if self.staging_dir.exists():
+            shutil.rmtree(self.staging_dir)
+        (self.staging_dir / "bin").mkdir(parents=True, exist_ok=True)
+
+        # 1. Base files
+        for f in ["module.prop", "customize.sh", "service.sh", "action.sh"]:
+            src = self.module_dir / f
+            if src.exists():
+                shutil.copy2(src, self.staging_dir / f)
+
+        # 2. Daemon binary
+        daemon_bin = daemon_bin or (self.module_dir / "daemon" / "target" / "aarch64-unknown-linux-musl" / "release" / "kread_daemon")
+        if daemon_bin and daemon_bin.exists():
+            dest_daemon = self.staging_dir / "bin" / "kread_daemon"
+            shutil.copy2(daemon_bin, dest_daemon)
+            os.chmod(dest_daemon, 0o755)
+
+        # 3. Kernel modules
+        ko_510 = ko_510 or (self.module_dir / "kread_5.10.ko")
+        ko_612 = ko_612 or (self.module_dir / "kread_6.12.ko")
+
+        if target in ("all", "universal"):
+            if ko_510.exists():
+                shutil.copy2(ko_510, self.staging_dir / "kread_5.10.ko")
+            if ko_612.exists():
+                shutil.copy2(ko_612, self.staging_dir / "kread_6.12.ko")
+            # If 6.12 exists, also provide default kread.ko symlink/copy
+            if ko_612.exists():
+                shutil.copy2(ko_612, self.staging_dir / "kread.ko")
+            elif ko_510.exists():
+                shutil.copy2(ko_510, self.staging_dir / "kread.ko")
+            zip_filename = f"kread-universal-v{self.version}.zip"
+        elif target == "5.10":
+            if ko_510.exists():
+                shutil.copy2(ko_510, self.staging_dir / "kread.ko")
+                shutil.copy2(ko_510, self.staging_dir / "kread_5.10.ko")
+            zip_filename = f"kread-android12-5.10-v{self.version}.zip"
+        elif target == "6.12":
+            if ko_612.exists():
+                shutil.copy2(ko_612, self.staging_dir / "kread.ko")
+                shutil.copy2(ko_612, self.staging_dir / "kread_6.12.ko")
+            zip_filename = f"kread-android16-6.12-v{self.version}.zip"
+        else:
+            zip_filename = f"kread-{target}-v{self.version}.zip"
+
+        dest_zip = self.out_dir / zip_filename
+
+        # Write ZIP with proper POSIX file permissions
+        with zipfile.ZipFile(dest_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+            for root, _, files in os.walk(self.staging_dir):
+                for f in sorted(files):
+                    file_path = Path(root) / f
+                    rel_path = file_path.relative_to(self.staging_dir)
+                    zinfo = zipfile.ZipInfo.from_file(file_path, arcname=str(rel_path))
+
+                    # Set executable bits for scripts and binary
+                    if f.endswith(".sh") or f == "kread_daemon":
+                        zinfo.external_attr = 0o100755 << 16
+                    else:
+                        zinfo.external_attr = 0o100644 << 16
+
+                    zf.writestr(zinfo, file_path.read_bytes())
+
+        # Also copy to extra_out_dir if specified (e.g. out/release/modules)
+        if extra_out_dir:
+            extra_out_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dest_zip, extra_out_dir / zip_filename)
+            console.print(f"  [dim]+ Mirrored to: {extra_out_dir / zip_filename}[/dim]")
+
+        # Convenience symlink
+        latest_symlink = self.out_dir / "kread-latest.zip"
+        try:
+            if latest_symlink.is_symlink() or latest_symlink.exists():
+                latest_symlink.unlink()
+            latest_symlink.symlink_to(dest_zip.name)
+        except Exception:
+            pass
+
+        file_size = format_bytes(dest_zip.stat().st_size)
+        sha256 = compute_sha256(dest_zip)
+
+        table = Table(title="🎉 kread Companion Module Packaging Complete", border_style="green")
+        table.add_column("Property", style="bold cyan")
+        table.add_column("Value", style="bold white")
+        table.add_row("Package", dest_zip.name)
+        table.add_row("Target", target.upper())
+        table.add_row("Size", file_size)
+        table.add_row("SHA256", sha256)
+        table.add_row("Location", str(dest_zip))
+        console.print(table)
+
+        return dest_zip
+
+    def run(self, target: str = "all", skip_daemon: bool = False, skip_ko: bool = False, do_package: bool = True, extra_out_dir: Optional[Path] = None):
+        """Unified execution workflow."""
+        ko_510 = None
+        ko_612 = None
+        daemon_bin = None
+
+        if not skip_ko:
+            if target in ("all", "5.10"):
+                ko_510 = self.build_ko_510()
+            if target in ("all", "6.12"):
+                ko_612 = self.build_ko_612()
+
+        if not skip_daemon:
+            daemon_bin = self.build_daemon()
+
+        if do_package:
+            return self.package(
+                target=target,
+                ko_510=ko_510,
+                ko_612=ko_612,
+                daemon_bin=daemon_bin,
+                extra_out_dir=extra_out_dir,
+            )
+        return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="kread Companion Unified Python Builder")
+    parser.add_argument("-t", "--target", choices=["all", "5.10", "6.12"], default="all", help="Target kernel (default: all)")
+    parser.add_argument("--skip-daemon", action="store_true", help="Skip compiling Rust daemon")
+    parser.add_argument("--skip-ko", action="store_true", help="Skip compiling kernel modules")
+    parser.add_argument("--no-package", action="store_true", help="Skip assembling flashable zip")
+    parser.add_argument("--extra-out-dir", type=str, default=None, help="Additional output directory")
+
+    args = parser.parse_args()
+    builder = KreadBuilder()
+    extra_dir = Path(args.extra_out_dir) if args.extra_out_dir else None
+    builder.run(
+        target=args.target,
+        skip_daemon=args.skip_daemon,
+        skip_ko=args.skip_ko,
+        do_package=not args.no_package,
+        extra_out_dir=extra_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()
