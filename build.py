@@ -104,10 +104,11 @@ class KreadBuilder:
 
         ko_file = self.module_dir / "kread.ko"
         if res.returncode == 0 and ko_file.exists():
-            dest_510 = self.module_dir / "kread_5.10.ko"
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            dest_510 = self.out_dir / "kread_5.10.ko"
             shutil.copy2(ko_file, dest_510)
             size_str = format_bytes(dest_510.stat().st_size)
-            console.print(f"  [bold green]✓ Built kread_5.10.ko ({size_str}) in {duration:.1f}s[/bold green]")
+            console.print(f"  [bold green]✓ Built kread_5.10.ko ({size_str}) in {duration:.1f}s -> {dest_510}[/bold green]")
             return dest_510
         else:
             console.print(f"[bold red]❌ Build 5.10 failed ({res.returncode}):[/bold red]")
@@ -128,10 +129,11 @@ class KreadBuilder:
 
         bazel_out = self.k612_root / "bazel-bin" / "modules" / "kread" / "kread" / "kread.ko"
         if res.returncode == 0 and bazel_out.exists():
-            dest_612 = self.module_dir / "kread_6.12.ko"
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            dest_612 = self.out_dir / "kread_6.12.ko"
             shutil.copy2(bazel_out, dest_612)
             size_str = format_bytes(dest_612.stat().st_size)
-            console.print(f"  [bold green]✓ Built kread_6.12.ko ({size_str}) in {duration:.1f}s[/bold green]")
+            console.print(f"  [bold green]✓ Built kread_6.12.ko ({size_str}) in {duration:.1f}s -> {dest_612}[/bold green]")
             return dest_612
         else:
             console.print(f"[bold red]❌ Build 6.12 failed ({res.returncode}):[/bold red]")
@@ -190,9 +192,17 @@ class KreadBuilder:
             os.chmod(dest_daemon, 0o755)
 
         # 3. Kernel modules
-        ko_510 = ko_510 or (self.module_dir / "kread_5.10.ko")
-        ko_612 = ko_612 or (self.module_dir / "kread_6.12.ko")
+        if ko_510 is None:
+            ko_510 = self.out_dir / "kread_5.10.ko"
+            if not ko_510.exists():
+                ko_510 = self.module_dir / "kread_5.10.ko"
 
+        if ko_612 is None:
+            ko_612 = self.out_dir / "kread_6.12.ko"
+            if not ko_612.exists():
+                ko_612 = self.module_dir / "kread_6.12.ko"
+
+        ver_clean = self.version.lstrip("v")
         if target in ("all", "universal"):
             if ko_510.exists():
                 shutil.copy2(ko_510, self.staging_dir / "kread_5.10.ko")
@@ -203,19 +213,19 @@ class KreadBuilder:
                 shutil.copy2(ko_612, self.staging_dir / "kread.ko")
             elif ko_510.exists():
                 shutil.copy2(ko_510, self.staging_dir / "kread.ko")
-            zip_filename = f"kread-universal-v{self.version}.zip"
+            zip_filename = f"kread-universal-v{ver_clean}.zip"
         elif target == "5.10":
             if ko_510.exists():
                 shutil.copy2(ko_510, self.staging_dir / "kread.ko")
                 shutil.copy2(ko_510, self.staging_dir / "kread_5.10.ko")
-            zip_filename = f"kread-android12-5.10-v{self.version}.zip"
+            zip_filename = f"kread-android12-5.10-v{ver_clean}.zip"
         elif target == "6.12":
             if ko_612.exists():
                 shutil.copy2(ko_612, self.staging_dir / "kread.ko")
                 shutil.copy2(ko_612, self.staging_dir / "kread_6.12.ko")
-            zip_filename = f"kread-android16-6.12-v{self.version}.zip"
+            zip_filename = f"kread-android16-6.12-v{ver_clean}.zip"
         else:
-            zip_filename = f"kread-{target}-v{self.version}.zip"
+            zip_filename = f"kread-{target}-v{ver_clean}.zip"
 
         dest_zip = self.out_dir / zip_filename
 
@@ -265,6 +275,63 @@ class KreadBuilder:
 
         return dest_zip
 
+    def clean(self, clean_all: bool = False):
+        """Clean intermediate compilation artifacts and caches at user request."""
+        console.print(f"\n[bold yellow]🧹 Cleaning kread module artifacts (clean_all={clean_all})...[/bold yellow]")
+        cleaned_count = 0
+
+        # 1. Module root intermediate files from Kbuild
+        root_patterns = [
+            "*.o", "*.mod", "*.mod.c", "*.mod.o", "*.lto.o", "*.cmd",
+            ".*.cmd", "Module.symvers", ".Module.symvers*", "modules.order", ".modules.order*",
+            "kread.ko", "kread_5.10.ko", "kread_6.12.ko"
+        ]
+        for pat in root_patterns:
+            for p in self.module_dir.glob(pat):
+                try:
+                    p.unlink()
+                    cleaned_count += 1
+                except Exception:
+                    pass
+
+        # ThinLTO cache and __pycache__
+        thinlto_dir = self.module_dir / ".thinlto-cache"
+        if thinlto_dir.exists():
+            shutil.rmtree(thinlto_dir, ignore_errors=True)
+            cleaned_count += 1
+
+        pycache_dir = self.module_dir / "__pycache__"
+        if pycache_dir.exists():
+            shutil.rmtree(pycache_dir, ignore_errors=True)
+            cleaned_count += 1
+
+        # 2. src/ intermediate files
+        src_dir = self.module_dir / "src"
+        if src_dir.exists():
+            for pat in ["*.o", "*.cmd", ".*.cmd"]:
+                for p in src_dir.glob(pat):
+                    try:
+                        p.unlink()
+                        cleaned_count += 1
+                    except Exception:
+                        pass
+
+        # 3. If clean_all: also clean out/ and daemon/target/
+        if clean_all:
+            if self.out_dir.exists():
+                shutil.rmtree(self.out_dir, ignore_errors=True)
+                cleaned_count += 1
+            daemon_target = self.module_dir / "daemon" / "target"
+            if daemon_target.exists():
+                shutil.rmtree(daemon_target, ignore_errors=True)
+                cleaned_count += 1
+            tests_bin = self.module_dir / "tests" / "bin"
+            if tests_bin.exists():
+                shutil.rmtree(tests_bin, ignore_errors=True)
+                cleaned_count += 1
+
+        console.print(f"  [bold green]✓ Cleaned {cleaned_count} items/directories.[/bold green]")
+
     def run(self, target: str = "all", skip_daemon: bool = False, skip_ko: bool = False, do_package: bool = True, extra_out_dir: Optional[Path] = None):
         """Unified execution workflow."""
         ko_510 = None
@@ -292,23 +359,38 @@ class KreadBuilder:
 
 
 def main():
+    argv = sys.argv[1:]
+    # Default to 'build' subcommand if no subcommand is given or build flags are passed directly
+    if not argv or argv[0] not in ("build", "clean", "-h", "--help"):
+        sys.argv.insert(1, "build")
+
     parser = argparse.ArgumentParser(description="kread Companion Unified Python Builder")
-    parser.add_argument("-t", "--target", choices=["all", "5.10", "6.12"], default="all", help="Target kernel (default: all)")
-    parser.add_argument("--skip-daemon", action="store_true", help="Skip compiling Rust daemon")
-    parser.add_argument("--skip-ko", action="store_true", help="Skip compiling kernel modules")
-    parser.add_argument("--no-package", action="store_true", help="Skip assembling flashable zip")
-    parser.add_argument("--extra-out-dir", type=str, default=None, help="Additional output directory")
+    subparsers = parser.add_subparsers(dest="subcommand", help="Subcommand to execute")
+
+    p_build = subparsers.add_parser("build", help="Build module components and package ZIP")
+    p_build.add_argument("-t", "--target", choices=["all", "5.10", "6.12"], default="all", help="Target kernel (default: all)")
+    p_build.add_argument("--skip-daemon", action="store_true", help="Skip compiling Rust daemon")
+    p_build.add_argument("--skip-ko", action="store_true", help="Skip compiling kernel modules")
+    p_build.add_argument("--no-package", action="store_true", help="Skip assembling flashable zip")
+    p_build.add_argument("--extra-out-dir", type=str, default=None, help="Additional output directory")
+
+    p_clean = subparsers.add_parser("clean", help="Clean compilation artifacts and intermediate files")
+    p_clean.add_argument("--all", action="store_true", help="Deep clean: remove out/ and daemon target/ as well")
 
     args = parser.parse_args()
     builder = KreadBuilder()
-    extra_dir = Path(args.extra_out_dir) if args.extra_out_dir else None
-    builder.run(
-        target=args.target,
-        skip_daemon=args.skip_daemon,
-        skip_ko=args.skip_ko,
-        do_package=not args.no_package,
-        extra_out_dir=extra_dir,
-    )
+
+    if args.subcommand == "clean":
+        builder.clean(clean_all=args.all)
+    else:
+        extra_dir = Path(args.extra_out_dir) if args.extra_out_dir else None
+        builder.run(
+            target=args.target,
+            skip_daemon=args.skip_daemon,
+            skip_ko=args.skip_ko,
+            do_package=not args.no_package,
+            extra_out_dir=extra_dir,
+        )
 
 
 if __name__ == "__main__":
