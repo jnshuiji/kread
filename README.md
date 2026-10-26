@@ -108,8 +108,10 @@ struct kread_ioctl_batch {
 
 ```
 modules/kread/
-├── BUILD.bazel             # Kleaf Bazel target (//modules/kread:kread -> kread.ko)
-├── build.sh                # One-click build script (Kernel Module + Rust Daemon + KernelSU zip)
+├── BUILD.bazel             # Kleaf Bazel target (//modules/kread:kread -> kread_6.12.ko)
+├── Kbuild                  # Linux Kbuild config for Android 12 Linux 5.10 GKI
+├── Makefile                # Out-of-tree makefile for Linux 5.10 GKI
+├── build.py                # Unified Python build engine (dual-kernel + daemon + universal zip)
 ├── module.prop             # KernelSU module metadata (id=kread, name=kread Companion)
 ├── customize.sh            # KernelSU flash installer environment verification script
 ├── service.sh              # KernelSU late-boot autostart (insmod + launch daemon)
@@ -161,15 +163,19 @@ The module is packaged as a standard flashable zip (`out/kread-1.zip`):
 
 ## 7. Build & Verification Guide
 
-### One-Click Build & Package
+### Unified Python Build & Package
 ```bash
-cd modules/kread
-./build.sh
+# From workspace root via gki CLI
+uv run gki module build kread
+
+# Or standalone inside module directory
+python3 build.py
 ```
 This automatically:
-1. Builds `kread.ko` using Kleaf Bazel (`//modules/kread:kread`).
-2. Builds `bin/kread_daemon` static ARM64 binary using Cargo musl cross-compiler.
-3. Stages and creates flashable zip `out/kread-1.zip`.
+1. Builds `kread_5.10.ko` using Android 12 Clang-r416183b & Linux Kbuild.
+2. Builds `kread_6.12.ko` using Android 16 Kleaf Bazel (`//modules/kread:kread`).
+3. Builds `bin/kread_daemon` static ARM64 binary using Cargo musl cross-compiler.
+4. Stages and creates universal dual-kernel flashable zip `out/kread-universal-v1.zip`.
 
 ### Compiling Test Suite
 ```bash
