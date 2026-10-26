@@ -71,13 +71,77 @@ class KreadBuilder:
                     return line.split("=", 1)[1].strip()
         return "1.0.0"
 
+    def _clean_source_tree_legacy_files(self):
+        """Guard: Ensure source tree (module root & src/) is 100% clean of build caches."""
+        root_patterns = [
+            "*.o", "*.mod", "*.mod.c", "*.mod.o", "*.lto.o", "*.cmd",
+            ".*.cmd", "Module.symvers", ".Module.symvers*", "modules.order", ".modules.order*",
+            "kread.ko", "kread_5.10.ko", "kread_6.12.ko"
+        ]
+        for pat in root_patterns:
+            for p in self.module_dir.glob(pat):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
+        thinlto_dir = self.module_dir / ".thinlto-cache"
+        if thinlto_dir.exists():
+            shutil.rmtree(thinlto_dir, ignore_errors=True)
+
+        pycache_dir = self.module_dir / "__pycache__"
+        if pycache_dir.exists():
+            shutil.rmtree(pycache_dir, ignore_errors=True)
+
+        src_dir = self.module_dir / "src"
+        if src_dir.exists():
+            for pat in ["*.o", "*.cmd", ".*.cmd"]:
+                for p in src_dir.glob(pat):
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+
+    def _setup_shadow_build_510(self) -> Path:
+        """Create and populate isolated shadow build directory under out/build_510."""
+        bld = self.out_dir / "build_510"
+        bld.mkdir(parents=True, exist_ok=True)
+        (bld / "src").mkdir(parents=True, exist_ok=True)
+
+        # Symlink Kbuild, Makefile, include
+        for f in ["Kbuild", "Makefile"]:
+            link = bld / f
+            target = self.module_dir / f
+            if not link.exists():
+                link.symlink_to(target)
+
+        include_link = bld / "include"
+        if not include_link.exists():
+            include_link.symlink_to(self.module_dir / "include")
+
+        # Symlink source files in src/
+        src_dir = self.module_dir / "src"
+        if src_dir.exists():
+            for src_file in src_dir.glob("*.c"):
+                link = bld / "src" / src_file.name
+                if not link.exists():
+                    link.symlink_to(src_file)
+
+        return bld
+
     def build_ko_510(self) -> Optional[Path]:
-        """Build kread_5.10.ko using android12-5.10 toolchain and out directory."""
+        """Build kread_5.10.ko using android12-5.10 toolchain and isolated shadow out/build_510."""
         console.print("[bold cyan]🔨 [1/3] Building kread.ko for Android 12 (Linux 5.10 GKI)...[/bold cyan]")
         kdir = self.k510_root / "out" / "android12-5.10" / "common"
         if not kdir.exists():
             console.print(f"[bold red]❌ Linux 5.10 build tree not found at {kdir}. Please build android12-5.10 first.[/bold red]")
             return None
+
+        # 1. Enforce clean source tree guard
+        self._clean_source_tree_legacy_files()
+
+        # 2. Setup shadow build directory
+        shadow_dir = self._setup_shadow_build_510()
 
         clang_bin = self.k510_root / "prebuilts-master" / "clang" / "host" / "linux-x86" / "clang-r416183b" / "bin"
         build_tools_bin = self.k510_root / "build" / "build-tools" / "path" / "linux-x86"
@@ -90,7 +154,7 @@ class KreadBuilder:
         cmd = [
             "make",
             "-C", str(kdir),
-            f"M={self.module_dir}",
+            f"M={shadow_dir}",
             "ARCH=arm64",
             "CROSS_COMPILE=aarch64-linux-gnu-",
             "LLVM=1",
@@ -99,10 +163,10 @@ class KreadBuilder:
         ]
 
         start_time = time.time()
-        res = subprocess.run(cmd, cwd=self.module_dir, env=env, capture_output=True, text=True)
+        res = subprocess.run(cmd, cwd=shadow_dir, env=env, capture_output=True, text=True)
         duration = time.time() - start_time
 
-        ko_file = self.module_dir / "kread.ko"
+        ko_file = shadow_dir / "kread.ko"
         if res.returncode == 0 and ko_file.exists():
             self.out_dir.mkdir(parents=True, exist_ok=True)
             dest_510 = self.out_dir / "kread_5.10.ko"
@@ -280,57 +344,33 @@ class KreadBuilder:
         console.print(f"\n[bold yellow]🧹 Cleaning kread module artifacts (clean_all={clean_all})...[/bold yellow]")
         cleaned_count = 0
 
-        # 1. Module root intermediate files from Kbuild
-        root_patterns = [
-            "*.o", "*.mod", "*.mod.c", "*.mod.o", "*.lto.o", "*.cmd",
-            ".*.cmd", "Module.symvers", ".Module.symvers*", "modules.order", ".modules.order*",
-            "kread.ko", "kread_5.10.ko", "kread_6.12.ko"
-        ]
-        for pat in root_patterns:
-            for p in self.module_dir.glob(pat):
-                try:
-                    p.unlink()
-                    cleaned_count += 1
-                except Exception:
-                    pass
+        # Guard: clean any legacy files from source tree (root and src/)
+        self._clean_source_tree_legacy_files()
 
-        # ThinLTO cache and __pycache__
-        thinlto_dir = self.module_dir / ".thinlto-cache"
-        if thinlto_dir.exists():
-            shutil.rmtree(thinlto_dir, ignore_errors=True)
+        # 1. Clean shadow build intermediate cache (out/build_510)
+        shadow_dir = self.out_dir / "build_510"
+        if shadow_dir.exists():
+            shutil.rmtree(shadow_dir, ignore_errors=True)
             cleaned_count += 1
+            console.print(f"  [dim]- Removed build cache: {shadow_dir}[/dim]")
 
-        pycache_dir = self.module_dir / "__pycache__"
-        if pycache_dir.exists():
-            shutil.rmtree(pycache_dir, ignore_errors=True)
-            cleaned_count += 1
-
-        # 2. src/ intermediate files
-        src_dir = self.module_dir / "src"
-        if src_dir.exists():
-            for pat in ["*.o", "*.cmd", ".*.cmd"]:
-                for p in src_dir.glob(pat):
-                    try:
-                        p.unlink()
-                        cleaned_count += 1
-                    except Exception:
-                        pass
-
-        # 3. If clean_all: also clean out/ and daemon/target/
+        # 2. If clean_all: deep clean out/ (zips, kos) and daemon/target/
         if clean_all:
             if self.out_dir.exists():
                 shutil.rmtree(self.out_dir, ignore_errors=True)
                 cleaned_count += 1
+                console.print(f"  [dim]- Removed output directory: {self.out_dir}[/dim]")
             daemon_target = self.module_dir / "daemon" / "target"
             if daemon_target.exists():
                 shutil.rmtree(daemon_target, ignore_errors=True)
                 cleaned_count += 1
+                console.print(f"  [dim]- Removed daemon target: {daemon_target}[/dim]")
             tests_bin = self.module_dir / "tests" / "bin"
             if tests_bin.exists():
                 shutil.rmtree(tests_bin, ignore_errors=True)
                 cleaned_count += 1
 
-        console.print(f"  [bold green]✓ Cleaned {cleaned_count} items/directories.[/bold green]")
+        console.print(f"  [bold green]✓ Clean operation complete ({cleaned_count} targets).[/bold green]")
 
     def run(self, target: str = "all", skip_daemon: bool = False, skip_ko: bool = False, do_package: bool = True, extra_out_dir: Optional[Path] = None):
         """Unified execution workflow."""
